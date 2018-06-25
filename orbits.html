@@ -1,0 +1,562 @@
+<html>
+<head><meta http-equiv="Content-Type" content="text/html; charset=us-ascii">
+	
+	<meta content="width=800, initial-scale=1" name="viewport" />
+	<title></title>
+	<script>
+	</script>
+</head>
+<body>
+<p><canvas id="canvas" style="margin: auto;"></canvas></p>
+
+<div id="underlay" style="width: 100%; height: 100%; z-index: -1; position: absolute; top: 0; background-color: #292929"></div>
+<script>
+		var canvas = document.getElementById('canvas');
+		var ctx = canvas.getContext('2d',{alpha: false});
+		ctx.canvas.width  = document.getElementById("underlay").offsetWidth;
+		ctx.canvas.height = document.getElementById("underlay").offsetHeight;
+		
+		
+		var boxes = [];
+		var wells = [];
+		
+		var point = function(x, y) {
+			return {
+				x: x,
+				y: y
+			}
+		}
+		function rotate_point(px, py, ox, oy, angle) {
+			return point(
+				Math.cos(angle) * (px - ox) - Math.sin(angle) * (py - oy) + ox,
+				Math.sin(angle) * (px - ox) + Math.cos(angle) * (py - oy) + oy
+			);
+		}
+		function distance(x1, y1, x2, y2) {
+			return Math.sqrt(Math.abs(Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2)));
+		}
+		
+		var clipx = true, clipy = true;
+		var maxboxes = 50000, 
+			baseangle = Math.PI / 12, 
+			event_horizon = 20,
+			bubbleradius = Math.max(Math.min(ctx.canvas.height, ctx.canvas.width) / 3, 300), 
+			bubbleorigin = point(ctx.canvas.width / 2, ctx.canvas.height / 2);
+		var raf, running = false;
+
+		var well = function(pos, g){
+			return {
+				pos: pos,
+				g: g
+			}
+		};
+
+		var box = function(){
+			var b = {
+				pos: point(10, 10),
+				//x: 10,
+				//y: 10,
+				dist_to_well: event_horizon + 1,
+				points: [],
+				size: 9,
+				size_jiggle: 0.5,
+				vertex_jiggle: 0.6,
+				padding: 20,
+				gravity: 10,
+				speed: -200,
+				velocity_x: 0,
+				velocity_y: 0,
+				direction: 0,
+				minx: -1,
+				miny: -1,
+				maxx: -1,
+				maxy: -1,
+				color: "rgb(255,255,255)",
+				init: function() {
+					this.size = this.size + (this.size  * this.size_jiggle) * (Math.random() - 0.5);	// size +- half of size
+					var randmax = this.size * this.vertex_jiggle,
+						x1 = 0, y1 = 0,
+						x2 = 0, y2 = 0,
+						x3 = 0, y3 = 0,
+						x4 = 0, y4 = 0;
+					
+					// Point 1 (NW)
+					x0 = this.pos.x			 	+ Math.random() * randmax;
+					y0 = this.pos.y			 	+ Math.random() * randmax;
+					// Point 2 (NE)
+					x1 = this.pos.x + this.size + Math.random() * randmax;
+					y1 = this.pos.y			 	+ Math.random() * randmax;
+					// Point 3 (SE)
+					x2 = this.pos.x + this.size + Math.random() * randmax;
+					y2 = this.pos.y + this.size + Math.random() * randmax;
+					// Point 4 (SW)
+					x3 = this.pos.x			 	+ Math.random() * randmax;
+					y3 = this.pos.y + this.size + Math.random() * randmax;
+										
+					// Points
+					this.points[0] = point(x0, y0);
+					this.points[1] = point(x1, y1);
+					this.points[2] = point(x2, y2);
+					this.points[3] = point(x3, y3);
+					
+					this.calculateExtents();
+				},
+				draw: function() {
+					if (this.visible()) {
+						ctx.beginPath();
+						
+						ctx.moveTo(Math.floor(this.points[0].x), Math.floor(this.points[0].y));// NW
+						for (var i = 1; i < this.points.length; i++) {
+							var p = this.points[i];
+							ctx.lineTo(Math.floor(p.x),Math.floor(p.y));
+						}
+
+						ctx.fillStyle = this.color;
+						ctx.fill();
+					}
+				},
+				rotate: function(angle) {
+					if (this.visible()) {
+						var origin = point(this.minx + (this.maxx - this.minx) / 2, this.miny + (this.maxy - this.miny) / 2);
+					
+						for (var i = 0; i < this.points.length; i++) {
+							var p = this.points[i],
+								newpoint = rotate_point(p.x, p.y, origin.x, origin.y, angle);
+							this.points[i] = newpoint;
+						}
+						
+						this.calculateExtents();
+					}
+				},
+				distort: function(x, y) {
+					if (this.visible()) {
+						var centre = this.centre(),
+							dist = distance(x, y, centre.x, centre.y),
+							distortion = this.speed*this.size / Math.pow(dist,2);	//inverse square
+						
+						for (var i = 0; i < this.points.length; i++) {
+							var p = this.points[i],
+								newpoint = point(p.x + (centre.x - x) * distortion, p.y + (centre.y - y) * distortion);
+							this.points[i] = newpoint;
+						}
+						
+						this.calculateExtents();
+					}
+				},
+				orbit: function() {
+					if (this.visible()) {
+						var centre = this.centre();
+						for (var iw = 0; iw < wells.length; iw++)
+						{
+
+							var
+								offset_x = wells[iw].pos.x - centre.x,
+								offset_y = wells[iw].pos.y - centre.y,
+
+								ratio = wells[iw].g / Math.sqrt(Math.pow(offset_x, 2) + Math.pow(offset_y, 2)) / 100000,
+
+								impulse_x = ratio * offset_x,
+								impulse_y = ratio * offset_y;
+
+							// if (dist_x < 0)
+							// 	impulse_x = impulse_x * -1;
+
+							// if (dist_y < 0)
+							// 	impulse_y = impulse_y * -1;
+
+							//if (dist_x < 0 && dist_y < 0)
+
+							// this.dist_to_well = dist;
+
+							this.velocity_x = this.velocity_x + impulse_x;
+							this.velocity_y = this.velocity_y + impulse_y;
+						}
+						//this.velocity_x = this.velocity_x + this.gravity * (this.size / Math.pow(dist, 2)) * (offset_x / offset_y);
+						//this.velocity_y = this.velocity_y + this.gravity * (this.size / Math.pow(dist, 2)) * (offset_y / offset_x);
+						
+						for (var i = 0; i < this.points.length; i++) {
+							var p = this.points[i],
+								newpoint = point(p.x + this.velocity_x, p.y + this.velocity_y);
+							this.points[i] = newpoint;
+						}
+						
+						this.calculateExtents();
+					}
+				},
+				boost: function(x, y) {
+					if (this.visible()) {
+						var centre = this.centre(),
+							dist = distance(x, y, centre.x, centre.y),
+							dist_x = x - centre.x,
+							dist_y = y - centre.y,
+
+							to_x = dist_x > 0 ? 1 : 1,
+							to_y = dist_y > 0 ? 1 : 1,
+
+							angle = Math.atan(Math.abs(dist_y) / Math.abs(dist_x)) - Math.PI / 2,
+
+							g = this.gravity * this.size / Math.pow(dist, 2),
+
+							impulse_x = g * Math.cos(angle),
+							impulse_y = g * Math.sin(angle),
+
+							distortion = this.gravity * this.size / Math.pow(dist,2);	//inverse square
+
+						if (dist_x < 0)
+							impulse_y = impulse_y * -1;
+
+						if (dist_y < 0)
+							impulse_x = impulse_x * 1;
+
+						//if (dist_x < 0 && dist_y < 0)
+
+						this.dist_to_well = dist;
+
+						this.velocity_x = this.velocity_x + impulse_x;
+						this.velocity_y = this.velocity_y + impulse_y;
+
+						//this.velocity_x = this.velocity_x + this.gravity * (this.size / Math.pow(dist, 2)) * (offset_x / offset_y);
+						//this.velocity_y = this.velocity_y + this.gravity * (this.size / Math.pow(dist, 2)) * (offset_y / offset_x);
+						
+						for (var i = 0; i < this.points.length; i++) {
+							var p = this.points[i],
+								newpoint = point(p.x + this.velocity_x, p.y + this.velocity_y);
+							this.points[i] = newpoint;
+						}
+						
+						this.calculateExtents();
+					}
+				},
+				clear: function() {
+					// clear existing
+					ctx.clearRect(this.minx, this.miny, this.maxx - this.minx, this.maxy - this.miny);
+				},
+				clipx: function() {
+					return this.minx < ctx.canvas.width && this.maxx > 0;
+				},
+				clipy: function() {
+					return this.miny < ctx.canvas.height && this.maxy > 0;
+				},
+				centre: function() {
+					return point(this.minx + (this.maxx - this.minx) / 2, this.miny + (this.maxy - this.miny) / 2);
+				},
+				calculateExtents: function() {
+					// reset
+					this.minx = -1;
+					this.miny = -1;
+					this.maxx = -1;
+					this.maxy = -1;
+				
+					// loop points
+					for (var i = 0; i < this.points.length; i++) {
+						var p = this.points[i];
+						if (this.minx == -1) {
+							this.minx = p.x;
+						} else {
+							this.minx = Math.min(this.minx, p.x);
+						}
+						if (this.miny == -1) {
+							this.miny = p.y;
+						} else {
+							this.miny = Math.min(this.miny, p.y);
+						}
+						this.maxx = Math.max(this.maxx, p.x);
+						this.maxy = Math.max(this.maxy, p.y);
+					}
+				},
+				visible: function() {
+					return this.clipx() && this.clipy() && !this.collide();
+				},
+				collide: function() {
+					var collide = false;
+					for (var i = 0; i < wells.length; i++)
+					{
+						var 
+							centre = this.centre(),
+							dist = distance(centre.x, centre.y, wells[i].pos.x, wells[i].pos.y);
+
+						if (dist <= wells[i].g)
+						{
+							collide = true;
+							break;
+						}
+					}
+					return collide;
+				}
+			};
+			b.init();
+			return b;
+		};
+		
+		function reset() {
+			// clear canvas
+			ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+			//drawText();
+			boxes = [];
+		}
+
+		function redraw_grid() {
+			reset();
+			while (boxes.length < maxboxes) {
+
+				var b = box(), newx = 0, newy = 0;
+				if (boxes.length > 0) {
+					var c = boxes[boxes.length - 1];
+
+					if (c.clipx()) {
+						// same row
+						newx = c.maxx + c.padding;	// increment xpos
+						newy = c.pos.y;
+					} else {
+						// new row
+						newy = c.pos.y + c.size + c.padding * 2;	// increment ypos
+					}
+					
+					// if (distance(newx, newy, bubbleorigin.x, bubbleorigin.y) < bubbleradius) {
+					// 	// In bubble - shift outside
+					// 	newx = bubbleorigin.x + (bubbleorigin.x - c.x);
+					// }
+
+					if (!c.clipy()) {
+						// no more vertical space
+						break;
+					}
+				}
+
+
+				b.pos = point(newx, newy);
+				b.init();	// re-init with new base position
+
+				
+				// draw
+				b.draw();
+				boxes.push(b);
+			}
+			
+			for (var i = boxes.length; i > 0; i--) {
+				var b = boxes.pop();
+				if (b.visible()) {
+					boxes.push(b);	// add back
+					break;
+				}
+			}
+		}
+		
+		function cartesian(radius, angle) {
+			return point(
+				radius * Math.cos(angle),
+				radius * Math.sin(angle)
+			);
+		}
+		
+		function polar(x, y) {
+			return {
+				radius: Math.sqrt(Math.pow(x, 2) + Math.pow(y, 2)),
+				angle: Math.atan2(y,x)
+			}
+		}
+		
+		function anglediff(lastbox, lastbox_polar) {
+			var circumfrence = 2 * Math.PI * lastbox_polar.radius;
+			var totalfit = circumfrence / (lastbox.size + lastbox.padding * 2);
+			var anglediff = 2 * Math.PI / totalfit;
+			
+			return anglediff;
+		}
+		
+		function redraw_radial() {
+			var radius_jiggle = 0.2;
+			reset();
+			while (boxes.length < maxboxes) {
+
+				var b = box(), newx = bubbleorigin.x, newy = bubbleorigin.y - bubbleradius;
+				if (boxes.length > 0) {
+					var c = boxes[boxes.length - 1];
+					var rc = point(c.x - bubbleorigin.x, c.y - bubbleorigin.y);
+					var oldpolar = polar(rc.x, rc.y);
+					var newangle = oldpolar.angle + anglediff(c, oldpolar);
+					var newradius = oldpolar.radius + (c.padding * (Math.random() - 0.5) * radius_jiggle);
+					if (oldpolar.angle < -0.5 * Math.PI && newangle > -0.5 * Math.PI) {
+						// start new ring
+						newradius = newradius + c.size + c.padding * 2;
+					}
+					
+					//console.log(oldpolar.angle / Math.PI);
+					var newpos = cartesian(newradius, newangle);
+					newx = newpos.x + bubbleorigin.x;
+					newy = newpos.y + bubbleorigin.y;
+				}
+
+
+				b.x = newx;
+				b.y = newy;
+				b.init();	// re-init with new base position
+
+				
+				// draw
+				b.draw();
+				boxes.push(b);
+			}
+			
+			var newboxes = [];
+			for (var i = boxes.length; i > 0; i--) {
+				var b = boxes.pop();
+				if (b.visible()) {
+					newboxes.push(b);	// add back
+				}
+			}
+			
+			boxes = newboxes;
+		}
+		
+		function jiggle_point(x, y, radius) {
+			// clear canvas
+			ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+			//drawText();	// redraw text
+			drawWells();	// redraw circle
+		
+			for (var i = 0; i < boxes.length; i++) {
+				var b = boxes[i];//,
+					//cp = b.centre(),
+					//dist = distance(x, y, cp.x, cp.y);
+				
+				// Check if visible
+				if (running){//b.visible()) {					
+					//var angle = 10*baseangle / Math.pow(dist, 2);
+					//angle = angle * Math.random() - angle/2;
+					
+					//boxes[i].rotate(angle);
+					boxes[i].orbit(x, y);
+				} else {
+					boxes[i].boost(x, y);
+				}
+				boxes[i].draw();	// always redraw
+			}
+			//raf = window.requestAnimationFrame(jiggle_point(x,y,radius));	// keep jiggling
+		}
+		
+		var currentwell = -1;
+		var clickstart = null;
+		var click_x = null, click_y = null;
+
+		canvas.addEventListener("mousedown", function(e)
+		{
+			if (e.shiftKey)
+			{
+				var a = []; // new array
+
+				for (var i = 0; i < wells.length; i++)
+				{
+					if (distance(wells[i].pos.x, wells[i].pos.y, e.clientX, e.clientY) > wells[i].g)
+					{
+						console.log("out");
+						a.push(wells[i]);	// click not in bounds of well
+					} else {
+						console.log("in");
+					}
+				}
+
+				wells = a;
+			} else {
+
+				clickstart = new Date();
+				currentwell = wells.length;
+
+				click_x = e.clientX;
+				click_y = e.clientY;
+
+				if (!running)
+				{
+					animate();
+					running = true;
+				}
+			}
+		});
+
+		canvas.addEventListener("mouseup", function(e)
+		{
+			if (clickstart != null)
+			{
+				var diff = new Date() - clickstart;
+
+				console.log("diff=" + diff)
+
+				wells[currentwell] = well(point(e.clientX, e.clientY), diff / 10);
+
+
+				raf = window.requestAnimationFrame(drawWells);
+
+				clickstart = null;
+
+				if (!running)
+				{
+					running = true;
+					animate();
+				}
+			}
+		});
+
+		document.addEventListener("keydown", function(e) {
+			animate();
+		});
+		
+
+
+		var well_x = bubbleorigin.x, well_y = bubbleorigin.y;
+		
+		function mouseout() {
+			jiggle_point(well_x, well_y, bubbleradius);
+			raf = window.requestAnimationFrame(mouseout);
+		}
+		
+		function animate() {
+			jiggle_point(well_x, well_y, bubbleradius);
+			raf = window.requestAnimationFrame(animate);
+		}
+
+		function drawWells() {
+			ctx.save();
+
+			if (clickstart != null)
+			{
+				var diff = new Date() - clickstart;
+				ctx.beginPath();
+				ctx.arc(click_x, click_y, diff / 10, 0, 2 * Math.PI);
+				ctx.fillStyle = "#334466";
+				ctx.fill();
+			}
+
+			for (var i = 0; i < wells.length; i++)
+			{
+				if (wells[i] != null)
+				{
+					ctx.beginPath();
+					ctx.arc(wells[i].pos.x, wells[i].pos.y, wells[i].g, 0, 2 * Math.PI);
+					ctx.fillStyle = "#334466";
+					ctx.fill();
+				}
+			}
+			ctx.restore();
+		}
+		
+		function drawText() {
+			ctx.save()
+			ctx.fillStyle = "#ffffff";
+			ctx.font = "48px Garamond, georgia, serif";
+			ctx.textAlign = "center";
+			ctx.fillText("\u2702", bubbleorigin.x, bubbleorigin.y - 100);
+			ctx.font = "bold italic 28px Garamond, georgia, serif";
+			ctx.fillText("Johanna Flynn", bubbleorigin.x, bubbleorigin.y - 62);
+			ctx.font = ctx.font.replace("bold ", "");
+			ctx.fillText("Ladies $30 | Mens $20 | Kids $10", bubbleorigin.x, bubbleorigin.y);
+			//ctx.font = "bold " + ctx.font;
+			ctx.fillText("0409 475 657", bubbleorigin.x, bubbleorigin.y + 62);
+			ctx.fillText("Doreen", bubbleorigin.x, bubbleorigin.y + 100);
+			ctx.restore();
+		}
+		
+		//reset();
+		redraw_grid();
+		//jiggle_mouse();
+	</script></body>
+</html>
